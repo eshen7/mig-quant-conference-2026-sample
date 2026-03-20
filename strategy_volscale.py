@@ -1,16 +1,13 @@
 """
 Combined ETF Stat Arb: Returns-Based + Adaptive Thresholds Ensemble
+with Volatility-Scaled Position Sizing
 ====================================================================
 
-Runs both strategies independently and sums their actions. This works because
-the two strategies discover different basket pairs (log-return OLS vs raw-price
-OLS), providing diversification. Combined max position stays under the 100-share
-limit.
-
-Best params (train_frac=0.85, trained through COVID crash):
-  Returns-based: entry_threshold=0.02, max_position=20, r2_cutoff=0.80
-  Adaptive:      k_entry=1.0, k_exit=0.1, vol_window=40, max_position=20
-  Combined PnL ≈ $43,729, Sharpe ≈ 2.75, MaxDD ≈ 4.0%
+Same as strategy_combined.py but adds volatility-scaled position sizing:
+- Computes a 20-day rolling std of the spread
+- Uses training-period spread std as the "normal" baseline volatility
+- Scales position size inversely with vol: position_size = min(max_position, int(target_risk / rolling_vol))
+  where target_risk = baseline_vol * max_position (so in normal vol you get ~max_position shares)
 """
 
 import numpy as np
@@ -18,11 +15,11 @@ from itertools import combinations
 
 
 # ---------------------------------------------------------------------------
-# Strategy 1: Returns-Based ETF Stat Arb
+# Strategy 1: Returns-Based ETF Stat Arb (with vol-scaled sizing)
 # ---------------------------------------------------------------------------
 def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
                    train_start=0, train_end=None, max_basket_size=4, hedge_ratio=0.5,
-                   max_position=20, r2_cutoff=0.80):
+                   max_position=20, r2_cutoff=0.80, vol_lookback=20):
     num_stocks, num_days = prices.shape
     actions = np.zeros((num_stocks, num_days), dtype=np.float64)
 
@@ -99,27 +96,45 @@ def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
         spread_mean = np.mean(train_spread)
         centered_spreads = spreads - spread_mean
 
+        # Volatility-scaled position sizing
+        baseline_vol = np.std(train_spread, ddof=1)
+        target_risk = baseline_vol * max_position  # so at normal vol, size = max_position
+
+        # Compute rolling vol of spread
+        rolling_vol = np.zeros(num_days)
+        for day in range(num_days):
+            start = max(0, day - vol_lookback + 1)
+            window_data = centered_spreads[start:day + 1]
+            if len(window_data) >= 2:
+                rolling_vol[day] = np.std(window_data, ddof=1)
+            else:
+                rolling_vol[day] = baseline_vol
+
         position = 0
         for day in range(1, num_days):
             spread = centered_spreads[day]
 
+            # Vol-scaled position size
+            rv = rolling_vol[day] if rolling_vol[day] > 1e-10 else baseline_vol
+            pos_size = min(max_position, max(1, int(target_risk / rv)))
+
             if position == 0:
                 if spread > entry_threshold:
                     position = -1
-                    actions[target, day] -= max_position
+                    actions[target, day] -= pos_size
                     for i, stock_idx in enumerate(basket):
-                        basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
-                        basket_shares = max(1, min(basket_shares, max_position))
+                        basket_shares = int(pos_size * abs(weights[i]) * hedge_ratio)
+                        basket_shares = max(1, min(basket_shares, pos_size))
                         if weights[i] > 0:
                             actions[stock_idx, day] += basket_shares
                         else:
                             actions[stock_idx, day] -= basket_shares
                 elif spread < -entry_threshold:
                     position = 1
-                    actions[target, day] += max_position
+                    actions[target, day] += pos_size
                     for i, stock_idx in enumerate(basket):
-                        basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
-                        basket_shares = max(1, min(basket_shares, max_position))
+                        basket_shares = int(pos_size * abs(weights[i]) * hedge_ratio)
+                        basket_shares = max(1, min(basket_shares, pos_size))
                         if weights[i] > 0:
                             actions[stock_idx, day] -= basket_shares
                         else:
@@ -128,10 +143,10 @@ def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
             elif position == 1:
                 if spread > exit_threshold:
                     position = 0
-                    actions[target, day] -= max_position
+                    actions[target, day] -= pos_size
                     for i, stock_idx in enumerate(basket):
-                        basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
-                        basket_shares = max(1, min(basket_shares, max_position))
+                        basket_shares = int(pos_size * abs(weights[i]) * hedge_ratio)
+                        basket_shares = max(1, min(basket_shares, pos_size))
                         if weights[i] > 0:
                             actions[stock_idx, day] += basket_shares
                         else:
@@ -140,10 +155,10 @@ def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
             elif position == -1:
                 if spread < exit_threshold:
                     position = 0
-                    actions[target, day] += max_position
+                    actions[target, day] += pos_size
                     for i, stock_idx in enumerate(basket):
-                        basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
-                        basket_shares = max(1, min(basket_shares, max_position))
+                        basket_shares = int(pos_size * abs(weights[i]) * hedge_ratio)
+                        basket_shares = max(1, min(basket_shares, pos_size))
                         if weights[i] > 0:
                             actions[stock_idx, day] -= basket_shares
                         else:
@@ -154,11 +169,11 @@ def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
 
 
 # ---------------------------------------------------------------------------
-# Strategy 2: Adaptive Threshold ETF Stat Arb
+# Strategy 2: Adaptive Threshold ETF Stat Arb (with vol-scaled sizing)
 # ---------------------------------------------------------------------------
 def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
                         train_start=0, train_end=None, max_basket_size=4, hedge_ratio=0.5,
-                        max_position=20):
+                        max_position=20, vol_lookback=20):
     num_stocks, num_days = prices.shape
     actions = np.zeros((num_stocks, num_days), dtype=np.float64)
 
@@ -233,6 +248,11 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
         spread_mean = np.mean(train_spread)
         centered_spreads = spreads - spread_mean
 
+        # Volatility-scaled position sizing
+        baseline_vol = np.std(train_spread, ddof=1)
+        target_risk = baseline_vol * max_position  # so at normal vol, size = max_position
+
+        # Rolling std for adaptive thresholds (existing)
         rolling_std = np.zeros(num_days)
         for day in range(num_days):
             start = max(0, day - vol_window + 1)
@@ -242,6 +262,16 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
             else:
                 rolling_std[day] = np.std(train_spread, ddof=1)
 
+        # Rolling vol for position sizing (separate lookback)
+        rolling_vol = np.zeros(num_days)
+        for day in range(num_days):
+            start = max(0, day - vol_lookback + 1)
+            window_data = centered_spreads[start:day + 1]
+            if len(window_data) >= 2:
+                rolling_vol[day] = np.std(window_data, ddof=1)
+            else:
+                rolling_vol[day] = baseline_vol
+
         position = 0
         for day in range(1, num_days):
             spread = centered_spreads[day]
@@ -250,23 +280,27 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
             entry_threshold = k_entry * vol
             exit_threshold = k_exit * vol
 
+            # Vol-scaled position size
+            rv = rolling_vol[day] if rolling_vol[day] > 1e-10 else baseline_vol
+            pos_size = min(max_position, max(1, int(target_risk / rv)))
+
             if position == 0:
                 if spread > entry_threshold:
                     position = -1
-                    actions[target, day] -= max_position
+                    actions[target, day] -= pos_size
                     for i, stock_idx in enumerate(basket):
-                        basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
-                        basket_shares = max(1, min(basket_shares, max_position))
+                        basket_shares = int(pos_size * abs(weights[i]) * hedge_ratio)
+                        basket_shares = max(1, min(basket_shares, pos_size))
                         if weights[i] > 0:
                             actions[stock_idx, day] += basket_shares
                         else:
                             actions[stock_idx, day] -= basket_shares
                 elif spread < -entry_threshold:
                     position = 1
-                    actions[target, day] += max_position
+                    actions[target, day] += pos_size
                     for i, stock_idx in enumerate(basket):
-                        basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
-                        basket_shares = max(1, min(basket_shares, max_position))
+                        basket_shares = int(pos_size * abs(weights[i]) * hedge_ratio)
+                        basket_shares = max(1, min(basket_shares, pos_size))
                         if weights[i] > 0:
                             actions[stock_idx, day] -= basket_shares
                         else:
@@ -275,10 +309,10 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
             elif position == 1:
                 if spread > exit_threshold:
                     position = 0
-                    actions[target, day] -= max_position
+                    actions[target, day] -= pos_size
                     for i, stock_idx in enumerate(basket):
-                        basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
-                        basket_shares = max(1, min(basket_shares, max_position))
+                        basket_shares = int(pos_size * abs(weights[i]) * hedge_ratio)
+                        basket_shares = max(1, min(basket_shares, pos_size))
                         if weights[i] > 0:
                             actions[stock_idx, day] += basket_shares
                         else:
@@ -287,10 +321,10 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
             elif position == -1:
                 if spread < -exit_threshold:
                     position = 0
-                    actions[target, day] += max_position
+                    actions[target, day] += pos_size
                     for i, stock_idx in enumerate(basket):
-                        basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
-                        basket_shares = max(1, min(basket_shares, max_position))
+                        basket_shares = int(pos_size * abs(weights[i]) * hedge_ratio)
+                        basket_shares = max(1, min(basket_shares, pos_size))
                         if weights[i] > 0:
                             actions[stock_idx, day] -= basket_shares
                         else:

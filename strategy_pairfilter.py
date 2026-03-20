@@ -1,20 +1,50 @@
 """
 Combined ETF Stat Arb: Returns-Based + Adaptive Thresholds Ensemble
+with Pair Correlation Filter
 ====================================================================
 
-Runs both strategies independently and sums their actions. This works because
-the two strategies discover different basket pairs (log-return OLS vs raw-price
-OLS), providing diversification. Combined max position stays under the 100-share
-limit.
-
-Best params (train_frac=0.85, trained through COVID crash):
-  Returns-based: entry_threshold=0.02, max_position=20, r2_cutoff=0.80
-  Adaptive:      k_entry=1.0, k_exit=0.1, vol_window=40, max_position=20
-  Combined PnL ≈ $43,729, Sharpe ≈ 2.75, MaxDD ≈ 4.0%
+Same as strategy_combined.py but adds a diversification filter:
+after selecting active_pairs, compute pairwise correlation between each
+pair's training spread. If two pairs' spreads have correlation > 0.7,
+drop the one with lower R². This ensures active pairs are diversified
+and losses don't pile up simultaneously.
 """
 
 import numpy as np
 from itertools import combinations
+
+
+def _filter_correlated_pairs(active_pairs, spread_dict, corr_threshold=0.7):
+    """
+    Given a list of active pair dicts and a dict mapping pair index -> training spread,
+    iteratively remove the pair with lower R² from any pair whose spreads are
+    correlated above corr_threshold.
+    """
+    if len(active_pairs) <= 1:
+        return active_pairs
+
+    # Build correlation matrix of training spreads
+    n = len(active_pairs)
+    spreads_matrix = np.array([spread_dict[i] for i in range(n)])
+    corr_matrix = np.corrcoef(spreads_matrix)
+
+    # Greedy removal: mark pairs to drop
+    keep = [True] * n
+    for i in range(n):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, n):
+            if not keep[j]:
+                continue
+            if abs(corr_matrix[i, j]) > corr_threshold:
+                # Drop the one with lower R²
+                if active_pairs[i]['r2'] >= active_pairs[j]['r2']:
+                    keep[j] = False
+                else:
+                    keep[i] = False
+                    break  # i is dropped, no need to compare i with others
+
+    return [p for p, k in zip(active_pairs, keep) if k]
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +113,24 @@ def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
             used_stocks.add(p['target'])
         if len(active_pairs) >= 10:
             break
+
+    # --- Pair correlation filter ---
+    # Compute training spread for each active pair
+    spread_dict = {}
+    for idx, pair in enumerate(active_pairs):
+        target = pair['target']
+        basket = pair['basket']
+        weights = pair['weights']
+
+        train_spreads = np.zeros(train_end - train_start)
+        for day in range(train_start, train_end):
+            basket_val = sum(weights[i] * log_returns[basket[i], day] for i in range(len(basket)))
+            basket_val += weights[-1]
+            train_spreads[day - train_start] = log_returns[target, day] - basket_val
+        spread_dict[idx] = train_spreads
+
+    active_pairs = _filter_correlated_pairs(active_pairs, spread_dict, corr_threshold=0.7)
+    # --- End filter ---
 
     for pair in active_pairs:
         target = pair['target']
@@ -217,6 +265,24 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
             used_stocks.add(p['target'])
         if len(active_pairs) >= 10:
             break
+
+    # --- Pair correlation filter ---
+    # Compute training spread for each active pair
+    spread_dict = {}
+    for idx, pair in enumerate(active_pairs):
+        target = pair['target']
+        basket = pair['basket']
+        weights = pair['weights']
+
+        train_spreads = np.zeros(train_end - train_start)
+        for day in range(train_start, train_end):
+            basket_val = sum(weights[i] * prices[basket[i], day] for i in range(len(basket)))
+            basket_val += weights[-1]
+            train_spreads[day - train_start] = prices[target, day] - basket_val
+        spread_dict[idx] = train_spreads
+
+    active_pairs = _filter_correlated_pairs(active_pairs, spread_dict, corr_threshold=0.7)
+    # --- End filter ---
 
     for pair in active_pairs:
         target = pair['target']

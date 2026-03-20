@@ -1,16 +1,13 @@
 """
-Combined ETF Stat Arb: Returns-Based + Adaptive Thresholds Ensemble
-====================================================================
+Combined ETF Stat Arb: Tight Exit Variant
+==========================================
 
-Runs both strategies independently and sums their actions. This works because
-the two strategies discover different basket pairs (log-return OLS vs raw-price
-OLS), providing diversification. Combined max position stays under the 100-share
-limit.
+Same as strategy_combined.py but with tighter exit thresholds to capture
+profits before full mean reversion.
 
-Best params (train_frac=0.85, trained through COVID crash):
-  Returns-based: entry_threshold=0.02, max_position=20, r2_cutoff=0.80
-  Adaptive:      k_entry=1.0, k_exit=0.1, vol_window=40, max_position=20
-  Combined PnL ≈ $43,729, Sharpe ≈ 2.75, MaxDD ≈ 4.0%
+Tuned params (selected via grid search over dev_data_30):
+  Returns-based: exit_threshold tuned (was 0.0)
+  Adaptive:      k_exit tuned (was 0.1)
 """
 
 import numpy as np
@@ -20,7 +17,7 @@ from itertools import combinations
 # ---------------------------------------------------------------------------
 # Strategy 1: Returns-Based ETF Stat Arb
 # ---------------------------------------------------------------------------
-def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
+def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.008,
                    train_start=0, train_end=None, max_basket_size=4, hedge_ratio=0.5,
                    max_position=20, r2_cutoff=0.80):
     num_stocks, num_days = prices.shape
@@ -156,7 +153,7 @@ def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
 # ---------------------------------------------------------------------------
 # Strategy 2: Adaptive Threshold ETF Stat Arb
 # ---------------------------------------------------------------------------
-def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
+def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.2, vol_window=40,
                         train_start=0, train_end=None, max_basket_size=4, hedge_ratio=0.5,
                         max_position=20):
     num_stocks, num_days = prices.shape
@@ -304,8 +301,8 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
 # Combined Ensemble
 # ---------------------------------------------------------------------------
 def get_actions(prices,
-                ret_entry=0.02, ret_max_pos=20, ret_r2=0.80,
-                adp_k_entry=1.0, adp_k_exit=0.1, adp_vol_window=40, adp_max_pos=20,
+                ret_entry=0.02, ret_exit=0.008, ret_max_pos=20, ret_r2=0.80,
+                adp_k_entry=1.0, adp_k_exit=0.2, adp_vol_window=40, adp_max_pos=20,
                 train_frac=0.85, train_start=None, train_end=None):
     num_days = prices.shape[1]
     if train_start is None:
@@ -313,7 +310,8 @@ def get_actions(prices,
     if train_end is None:
         train_end = int(num_days * train_frac)
     acts_ret = _returns_based(
-        prices, entry_threshold=ret_entry, max_position=ret_max_pos,
+        prices, entry_threshold=ret_entry, exit_threshold=ret_exit,
+        max_position=ret_max_pos,
         r2_cutoff=ret_r2, train_start=train_start, train_end=train_end,
     )
     acts_adp = _adaptive_threshold(

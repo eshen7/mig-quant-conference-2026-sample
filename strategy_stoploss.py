@@ -1,16 +1,11 @@
 """
 Combined ETF Stat Arb: Returns-Based + Adaptive Thresholds Ensemble
 ====================================================================
+WITH PER-PAIR STOP-LOSSES
 
-Runs both strategies independently and sums their actions. This works because
-the two strategies discover different basket pairs (log-return OLS vs raw-price
-OLS), providing diversification. Combined max position stays under the 100-share
-limit.
-
-Best params (train_frac=0.85, trained through COVID crash):
-  Returns-based: entry_threshold=0.02, max_position=20, r2_cutoff=0.80
-  Adaptive:      k_entry=1.0, k_exit=0.1, vol_window=40, max_position=20
-  Combined PnL ≈ $43,729, Sharpe ≈ 2.75, MaxDD ≈ 4.0%
+Same as strategy_combined.py but adds a stop-loss per pair:
+  - If the spread moves against the position by more than 3x the entry
+    threshold, the position is flattened (reversed).
 """
 
 import numpy as np
@@ -18,11 +13,11 @@ from itertools import combinations
 
 
 # ---------------------------------------------------------------------------
-# Strategy 1: Returns-Based ETF Stat Arb
+# Strategy 1: Returns-Based ETF Stat Arb (with stop-loss)
 # ---------------------------------------------------------------------------
 def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
                    train_start=0, train_end=None, max_basket_size=4, hedge_ratio=0.5,
-                   max_position=20, r2_cutoff=0.80):
+                   max_position=20, r2_cutoff=0.80, stoploss_mult=3.0):
     num_stocks, num_days = prices.shape
     actions = np.zeros((num_stocks, num_days), dtype=np.float64)
 
@@ -99,13 +94,17 @@ def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
         spread_mean = np.mean(train_spread)
         centered_spreads = spreads - spread_mean
 
+        stop_threshold = stoploss_mult * entry_threshold
+
         position = 0
+        entry_spread = 0.0
         for day in range(1, num_days):
             spread = centered_spreads[day]
 
             if position == 0:
                 if spread > entry_threshold:
                     position = -1
+                    entry_spread = spread
                     actions[target, day] -= max_position
                     for i, stock_idx in enumerate(basket):
                         basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
@@ -116,6 +115,7 @@ def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
                             actions[stock_idx, day] -= basket_shares
                 elif spread < -entry_threshold:
                     position = 1
+                    entry_spread = spread
                     actions[target, day] += max_position
                     for i, stock_idx in enumerate(basket):
                         basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
@@ -126,7 +126,20 @@ def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
                             actions[stock_idx, day] += basket_shares
 
             elif position == 1:
-                if spread > exit_threshold:
+                # Stop-loss: we are long the spread; spread moving further
+                # negative (against us) by 3x entry_threshold from entry
+                if spread < entry_spread - stop_threshold:
+                    # flatten
+                    position = 0
+                    actions[target, day] -= max_position
+                    for i, stock_idx in enumerate(basket):
+                        basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
+                        basket_shares = max(1, min(basket_shares, max_position))
+                        if weights[i] > 0:
+                            actions[stock_idx, day] += basket_shares
+                        else:
+                            actions[stock_idx, day] -= basket_shares
+                elif spread > exit_threshold:
                     position = 0
                     actions[target, day] -= max_position
                     for i, stock_idx in enumerate(basket):
@@ -138,7 +151,20 @@ def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
                             actions[stock_idx, day] -= basket_shares
 
             elif position == -1:
-                if spread < exit_threshold:
+                # Stop-loss: we are short the spread; spread moving further
+                # positive (against us) by 3x entry_threshold from entry
+                if spread > entry_spread + stop_threshold:
+                    # flatten
+                    position = 0
+                    actions[target, day] += max_position
+                    for i, stock_idx in enumerate(basket):
+                        basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
+                        basket_shares = max(1, min(basket_shares, max_position))
+                        if weights[i] > 0:
+                            actions[stock_idx, day] -= basket_shares
+                        else:
+                            actions[stock_idx, day] += basket_shares
+                elif spread < exit_threshold:
                     position = 0
                     actions[target, day] += max_position
                     for i, stock_idx in enumerate(basket):
@@ -154,11 +180,11 @@ def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
 
 
 # ---------------------------------------------------------------------------
-# Strategy 2: Adaptive Threshold ETF Stat Arb
+# Strategy 2: Adaptive Threshold ETF Stat Arb (with stop-loss)
 # ---------------------------------------------------------------------------
 def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
                         train_start=0, train_end=None, max_basket_size=4, hedge_ratio=0.5,
-                        max_position=20):
+                        max_position=20, stoploss_mult=3.0):
     num_stocks, num_days = prices.shape
     actions = np.zeros((num_stocks, num_days), dtype=np.float64)
 
@@ -243,6 +269,8 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
                 rolling_std[day] = np.std(train_spread, ddof=1)
 
         position = 0
+        entry_threshold_at_entry = 0.0
+        entry_spread = 0.0
         for day in range(1, num_days):
             spread = centered_spreads[day]
             vol = rolling_std[day]
@@ -253,6 +281,8 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
             if position == 0:
                 if spread > entry_threshold:
                     position = -1
+                    entry_spread = spread
+                    entry_threshold_at_entry = entry_threshold
                     actions[target, day] -= max_position
                     for i, stock_idx in enumerate(basket):
                         basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
@@ -263,6 +293,8 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
                             actions[stock_idx, day] -= basket_shares
                 elif spread < -entry_threshold:
                     position = 1
+                    entry_spread = spread
+                    entry_threshold_at_entry = entry_threshold
                     actions[target, day] += max_position
                     for i, stock_idx in enumerate(basket):
                         basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
@@ -273,7 +305,19 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
                             actions[stock_idx, day] += basket_shares
 
             elif position == 1:
-                if spread > exit_threshold:
+                stop_level = stoploss_mult * entry_threshold_at_entry
+                # Stop-loss: long spread, stop if spread drops further against us
+                if spread < entry_spread - stop_level:
+                    position = 0
+                    actions[target, day] -= max_position
+                    for i, stock_idx in enumerate(basket):
+                        basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
+                        basket_shares = max(1, min(basket_shares, max_position))
+                        if weights[i] > 0:
+                            actions[stock_idx, day] += basket_shares
+                        else:
+                            actions[stock_idx, day] -= basket_shares
+                elif spread > exit_threshold:
                     position = 0
                     actions[target, day] -= max_position
                     for i, stock_idx in enumerate(basket):
@@ -285,7 +329,19 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
                             actions[stock_idx, day] -= basket_shares
 
             elif position == -1:
-                if spread < -exit_threshold:
+                stop_level = stoploss_mult * entry_threshold_at_entry
+                # Stop-loss: short spread, stop if spread rises further against us
+                if spread > entry_spread + stop_level:
+                    position = 0
+                    actions[target, day] += max_position
+                    for i, stock_idx in enumerate(basket):
+                        basket_shares = int(max_position * abs(weights[i]) * hedge_ratio)
+                        basket_shares = max(1, min(basket_shares, max_position))
+                        if weights[i] > 0:
+                            actions[stock_idx, day] -= basket_shares
+                        else:
+                            actions[stock_idx, day] += basket_shares
+                elif spread < -exit_threshold:
                     position = 0
                     actions[target, day] += max_position
                     for i, stock_idx in enumerate(basket):

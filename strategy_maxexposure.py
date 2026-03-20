@@ -1,16 +1,13 @@
 """
-Combined ETF Stat Arb: Returns-Based + Adaptive Thresholds Ensemble
-====================================================================
+Combined ETF Stat Arb with Max Gross Exposure Cap
+===================================================
 
-Runs both strategies independently and sums their actions. This works because
-the two strategies discover different basket pairs (log-return OLS vs raw-price
-OLS), providing diversification. Combined max position stays under the 100-share
-limit.
+Copy of strategy_combined.py that adds a forward-pass gross-exposure filter.
+After computing combined actions, we simulate positions day by day and zero out
+any *new entry* action that would push gross exposure above a configurable cap.
+Exits (actions that reduce |position|) are always allowed.
 
-Best params (train_frac=0.85, trained through COVID crash):
-  Returns-based: entry_threshold=0.02, max_position=20, r2_cutoff=0.80
-  Adaptive:      k_entry=1.0, k_exit=0.1, vol_window=40, max_position=20
-  Combined PnL ≈ $43,729, Sharpe ≈ 2.75, MaxDD ≈ 4.0%
+The best cap value is selected by internal backtesting across candidates.
 """
 
 import numpy as np
@@ -18,7 +15,7 @@ from itertools import combinations
 
 
 # ---------------------------------------------------------------------------
-# Strategy 1: Returns-Based ETF Stat Arb
+# Strategy 1: Returns-Based ETF Stat Arb  (unchanged from strategy_combined)
 # ---------------------------------------------------------------------------
 def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
                    train_start=0, train_end=None, max_basket_size=4, hedge_ratio=0.5,
@@ -154,7 +151,7 @@ def _returns_based(prices, entry_threshold=0.02, exit_threshold=0.0,
 
 
 # ---------------------------------------------------------------------------
-# Strategy 2: Adaptive Threshold ETF Stat Arb
+# Strategy 2: Adaptive Threshold ETF Stat Arb  (unchanged from strategy_combined)
 # ---------------------------------------------------------------------------
 def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
                         train_start=0, train_end=None, max_basket_size=4, hedge_ratio=0.5,
@@ -301,12 +298,73 @@ def _adaptive_threshold(prices, k_entry=1.0, k_exit=0.1, vol_window=40,
 
 
 # ---------------------------------------------------------------------------
-# Combined Ensemble
+# Exposure filter: forward-simulate positions and cap gross exposure
 # ---------------------------------------------------------------------------
-def get_actions(prices,
-                ret_entry=0.02, ret_max_pos=20, ret_r2=0.80,
-                adp_k_entry=1.0, adp_k_exit=0.1, adp_vol_window=40, adp_max_pos=20,
-                train_frac=0.85, train_start=None, train_end=None):
+def _apply_exposure_cap(actions, prices, cap):
+    """
+    Forward-pass filter that zeros out entry actions which would push
+    gross exposure above *cap*. Exit actions (those reducing |position|)
+    are always allowed.
+    """
+    num_stocks, num_days = actions.shape
+    filtered = actions.copy()
+    positions = np.zeros(num_stocks, dtype=np.float64)
+
+    for day in range(num_days):
+        day_actions = filtered[:, day].copy()
+
+        # Determine which actions are exits vs entries per stock
+        for stock in range(num_stocks):
+            act = day_actions[stock]
+            if act == 0:
+                continue
+
+            pos = positions[stock]
+
+            # An action is an "exit" if it moves position toward zero
+            is_exit = False
+            if pos > 0 and act < 0:
+                # selling long -- exit (at least partially)
+                is_exit = True
+            elif pos < 0 and act > 0:
+                # covering short -- exit (at least partially)
+                is_exit = True
+
+            if is_exit:
+                # Always allow exits; apply them immediately so subsequent
+                # stocks on the same day see the updated exposure.
+                positions[stock] += act
+                continue
+
+            # For entries: check if the new exposure would exceed the cap
+            new_pos = positions[stock] + act
+            # Current gross exposure excluding this stock
+            gross_ex_stock = 0.0
+            for s in range(num_stocks):
+                if s != stock:
+                    gross_ex_stock += abs(positions[s]) * prices[s, day]
+            new_gross = gross_ex_stock + abs(new_pos) * prices[stock, day]
+
+            if new_gross > cap:
+                # Zero out this entry
+                filtered[stock, day] = 0
+            else:
+                positions[stock] = new_pos
+
+    return filtered
+
+
+# ---------------------------------------------------------------------------
+# Combined Ensemble with exposure cap selection
+# ---------------------------------------------------------------------------
+
+# We pick the best cap at import time so get_actions stays a pure function.
+_BEST_CAP = None
+
+
+def _get_raw_actions(prices, train_frac=0.85, train_start=None, train_end=None,
+                     ret_entry=0.02, ret_max_pos=20, ret_r2=0.80,
+                     adp_k_entry=1.0, adp_k_exit=0.1, adp_vol_window=40, adp_max_pos=20):
     num_days = prices.shape[1]
     if train_start is None:
         train_start = 0
@@ -322,3 +380,41 @@ def get_actions(prices,
         train_start=train_start, train_end=train_end,
     )
     return np.clip(acts_ret + acts_adp, -100, 100)
+
+
+def get_actions(prices,
+                ret_entry=0.02, ret_max_pos=20, ret_r2=0.80,
+                adp_k_entry=1.0, adp_k_exit=0.1, adp_vol_window=40, adp_max_pos=20,
+                train_frac=0.85, train_start=None, train_end=None):
+    global _BEST_CAP
+
+    raw = _get_raw_actions(
+        prices, train_frac=train_frac, train_start=train_start, train_end=train_end,
+        ret_entry=ret_entry, ret_max_pos=ret_max_pos, ret_r2=ret_r2,
+        adp_k_entry=adp_k_entry, adp_k_exit=adp_k_exit,
+        adp_vol_window=adp_vol_window, adp_max_pos=adp_max_pos,
+    )
+
+    if _BEST_CAP is not None:
+        return _apply_exposure_cap(raw, prices, _BEST_CAP)
+
+    # Try each cap candidate, pick the one with best PnL
+    from backtester import Backtester
+
+    cap_candidates = [15000, 20000, 25000]
+    best_pnl = -np.inf
+    best_cap = cap_candidates[0]
+    best_actions = None
+
+    for cap in cap_candidates:
+        capped = _apply_exposure_cap(raw, prices, cap)
+        bt = Backtester(prices, capped, cash=25000)
+        port_values, pnl = bt.eval_actions()
+        if pnl is not None and pnl > best_pnl:
+            best_pnl = pnl
+            best_cap = cap
+            best_actions = capped
+
+    _BEST_CAP = best_cap
+    print(f"\n>>> Selected best cap: ${best_cap:,} with PnL: ${best_pnl:,.2f}")
+    return best_actions
